@@ -1,7 +1,6 @@
 // src/checkFinalInteractions.js
-// src/checkFinalInteractions.js
 const Tweet = require('./models/Tweet');
-const { getTweetLikingUsers, getTweetRetweetingUsers } = require('./utils/twitterAuth');
+const twitterClient = require('./utils/twitterClient');
 const rewardTweetInteractions = require('./utils/rewardTweetInteractions');
 const { EmbedBuilder } = require('discord.js');
 const winston = require('winston');
@@ -24,9 +23,10 @@ async function checkFinalInteractions() {
 
     for (const tweet of pendingTweets) {
       try {
+        // Use rate-limited Twitter client
         const [likingData, retweetData] = await Promise.all([
-          getTweetLikingUsers(tweet.tweetId),
-          getTweetRetweetingUsers(tweet.tweetId),
+          twitterClient.getTweetLikingUsers(tweet.tweetId),
+          twitterClient.getTweetRetweetingUsers(tweet.tweetId),
         ]);
 
         const newLikedIds = (likingData?.data || []).map(u => u.id);
@@ -62,6 +62,12 @@ async function checkFinalInteractions() {
           }
         }
       } catch (err) {
+        // Check for rate limit errors
+        if (err.message && err.message.includes('Rate limit exceeded')) {
+          logger.warn(`[Scheduler] Twitter API rate limit reached while processing tweet ID=${tweet.tweetId}. Skipping for now.`);
+          continue; // Skip this tweet and try the next one
+        }
+        
         logger.error(`Error processing tweet ID=${tweet.tweetId}:`, err);
       }
     }

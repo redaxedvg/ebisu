@@ -1,13 +1,14 @@
-// src/utils/twitterAuth.js
+// src/utils/twitterClient.js
 const axios = require('axios');
 const crypto = require('crypto');
 const OAuth = require('oauth-1.0a');
 const logger = require('./logger');
 const config = require('../config');
 const { defaultCache } = require('./cacheManager');
+const { getRateLimit } = require('../config/twitterRateLimits');
 
 /**
- * Twitter API Client with built-in caching and error handling
+ * Twitter API Client with configurable rate limits, retries, and caching
  */
 class TwitterClient {
   constructor() {
@@ -33,11 +34,9 @@ class TwitterClient {
     
     this.contextLog = logger.withContext({ module: 'TwitterClient' });
     
-    // Request throttling
-    this.requestCounts = {
-      lastResetTime: Date.now(),
-      counts: {}
-    };
+    // Request tracking for rate limiting
+    this.requestCounts = {};
+    this.lastReset = Date.now();
   }
   
   /**
@@ -61,41 +60,44 @@ class TwitterClient {
   }
   
   /**
-   * Track API request rate and handle throttling
-   * @param {string} endpoint - API endpoint being called
-   * @returns {boolean} False if rate limit exceeded
+   * Check if an endpoint has exceeded its rate limit
+   * @param {string} endpoint - API endpoint to check
+   * @returns {Object} Rate limit status and information
    */
-  trackRequestRate(endpoint) {
+  checkRateLimit(endpoint) {
     const now = Date.now();
-    const resetWindow = 15 * 60 * 1000; // 15 minutes
+    const rateLimit = getRateLimit(endpoint);
+    const { limit, windowMinutes } = rateLimit;
+    const windowMs = windowMinutes * 60 * 1000;
     
-    // Reset counters if window has passed
-    if (now - this.requestCounts.lastResetTime > resetWindow) {
-      this.requestCounts = {
-        lastResetTime: now,
-        counts: {}
-      };
+    // Reset counts if outside window
+    if (now - this.lastReset > windowMs) {
+      this.requestCounts = {};
+      this.lastReset = now;
     }
     
-    // Initialize or increment endpoint counter
-    this.requestCounts.counts[endpoint] = (this.requestCounts.counts[endpoint] || 0) + 1;
+    // Initialize or increment count
+    this.requestCounts[endpoint] = (this.requestCounts[endpoint] || 0) + 1;
+    const currentCount = this.requestCounts[endpoint];
     
-    // Check rate limits based on endpoint
-    // Twitter v2 rate limits vary by endpoint
-    const rateLimit = endpoint.includes('/liking_users') || endpoint.includes('/retweeted_by')
-      ? 75  // Lower limit for these endpoints
-      : 180; // Default limit for most endpoints
+    // Check if limit exceeded
+    const isLimited = currentCount > limit;
     
-    if (this.requestCounts.counts[endpoint] > rateLimit) {
-      this.contextLog.warn('Rate limit exceeded for Twitter API', {
-        endpoint,
-        count: this.requestCounts.counts[endpoint],
-        limit: rateLimit
-      });
-      return false;
-    }
+    // Calculate reset time
+    const resetTime = this.lastReset + windowMs;
+    const waitTimeMs = Math.max(0, resetTime - now);
+    const waitTimeMinutes = Math.ceil(waitTimeMs / 60000);
     
-    return true;
+    return {
+      isLimited,
+      currentCount,
+      limit,
+      resetTime,
+      waitTimeMs,
+      waitTimeMinutes,
+      endpoint,
+      description: rateLimit.description
+    };
   }
   
   /**
@@ -107,11 +109,19 @@ class TwitterClient {
    */
   async get(url, params = {}, options = {}) {
     // Extract endpoint for rate limiting
-    const endpoint = url.split('?')[0].split('twitter.com')[1];
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname;
     
     // Check rate limits
-    if (!options.bypassRateLimit && !this.trackRequestRate(endpoint)) {
-      throw new Error(`Rate limit exceeded for endpoint: ${endpoint}`);
+    const rateLimitStatus = this.checkRateLimit(pathname);
+    
+    if (rateLimitStatus.isLimited && !options.bypassRateLimit) {
+      this.contextLog.warn('Twitter API rate limit exceeded', rateLimitStatus);
+      throw new Error(
+        `Rate limit exceeded for ${pathname}. ` + 
+        `Used ${rateLimitStatus.currentCount}/${rateLimitStatus.limit} requests. ` +
+        `Resets in ${rateLimitStatus.waitTimeMinutes} minutes.`
+      );
     }
     
     // Check cache if enabled
@@ -120,7 +130,7 @@ class TwitterClient {
       const cached = defaultCache.get(cacheKey);
       
       if (cached) {
-        this.contextLog.debug('Using cached Twitter response', { endpoint });
+        this.contextLog.debug('Using cached Twitter response', { endpoint: pathname });
         return cached;
       }
     }
@@ -136,14 +146,15 @@ class TwitterClient {
       };
       
       this.contextLog.debug('Making Twitter API request', { 
-        endpoint,
+        endpoint: pathname,
         params: Object.keys(params)
       });
       
       // Make the request
       const response = await axios.get(url, { 
         headers,
-        params
+        params,
+        timeout: options.timeout || 10000
       });
       
       // Cache successful responses
@@ -168,14 +179,15 @@ class TwitterClient {
    */
   handleApiError(error, url, params) {
     // Extract endpoint for better error reporting
-    const endpoint = url.split('?')[0].split('twitter.com')[1];
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname;
     
     if (error.response) {
       // Twitter API returned an error
       const { status, data } = error.response;
       
       this.contextLog.error('Twitter API error response', {
-        endpoint,
+        endpoint: pathname,
         status,
         errorCode: data?.errors?.[0]?.code,
         errorMessage: data?.errors?.[0]?.message,
@@ -184,19 +196,25 @@ class TwitterClient {
       
       // Handle specific error codes
       if (status === 429) {
-        // Rate limit exceeded - force reset our counter
-        this.requestCounts.counts[endpoint] = 999;
+        // Rate limit exceeded
+        const resetHeader = error.response.headers['x-rate-limit-reset'];
+        if (resetHeader) {
+          const resetTime = new Date(parseInt(resetHeader) * 1000);
+          const waitTime = Math.ceil((resetTime - new Date()) / 1000);
+          
+          this.contextLog.warn(`Rate limit exceeded for ${pathname}. Resets in ${waitTime} seconds.`);
+        }
       }
     } else if (error.request) {
       // No response received
       this.contextLog.error('Twitter API request error (no response)', {
-        endpoint,
+        endpoint: pathname,
         message: error.message
       });
     } else {
       // Error setting up the request
       this.contextLog.error('Twitter API client error', {
-        endpoint,
+        endpoint: pathname,
         message: error.message,
         stack: error.stack
       });
@@ -281,6 +299,60 @@ class TwitterClient {
       cacheTTL: 3600, // 1 hour cache for user info
       ...options
     });
+  }
+  
+  /**
+   * Get current rate limit status for an endpoint
+   * @param {string} endpoint - The API endpoint to check
+   * @returns {Object} Current rate limit information
+   */
+  getRateLimitStatus(endpoint) {
+    return this.checkRateLimit(endpoint);
+  }
+  
+  /**
+   * Get all rate limit statuses
+   * @returns {Object} All rate limit information
+   */
+  getAllRateLimitStatuses() {
+    const now = Date.now();
+    const allEndpoints = Object.keys(this.requestCounts);
+    
+    return allEndpoints.map(endpoint => {
+      const status = this.checkRateLimit(endpoint);
+      status.remainingRequests = status.limit - status.currentCount;
+      status.resetInMinutes = Math.ceil((status.resetTime - now) / 60000);
+      return status;
+    });
+  }
+  
+  /**
+   * Clear the cache for Twitter API responses
+   * @param {string} pattern - Optional URL pattern to match
+   * @returns {number} Number of cache entries cleared
+   */
+  clearCache(pattern = '') {
+    let count = 0;
+    const keys = defaultCache.cache.keys();
+    
+    for (const key of keys) {
+      if (key.startsWith('twitter:') && key.includes(pattern)) {
+        defaultCache.del(key);
+        count++;
+      }
+    }
+    
+    this.contextLog.info(`Cleared ${count} Twitter API cache entries`);
+    return count;
+  }
+  
+  /**
+   * Reset rate limit counters for testing or after configuration changes
+   */
+  resetRateLimitCounters() {
+    this.requestCounts = {};
+    this.lastReset = Date.now();
+    this.contextLog.info('Reset all Twitter API rate limit counters');
   }
 }
 

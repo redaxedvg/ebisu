@@ -2,7 +2,7 @@
 const { PermissionsBitField } = require('discord.js');
 const Tweet = require('../models/Tweet');
 const rewardTweetInteractions = require('../utils/rewardTweetInteractions');
-const { getTweetLikingUsers, getTweetRetweetingUsers } = require('../utils/twitterAuth');
+const twitterClient = require('../utils/twitterClient');
 const winston = require('winston');
 
 const logger = winston.createLogger({
@@ -31,26 +31,38 @@ module.exports = {
         return interaction.editReply(`No tweet found with ID: ${tweetId}`);
       }
 
-      // Fetch new liking/retweeting users
-      const [likingData, retweetData] = await Promise.all([
-        getTweetLikingUsers(tweet.tweetId),
-        getTweetRetweetingUsers(tweet.tweetId),
-      ]);
+      try {
+        // Fetch new liking/retweeting users using rate-limited client
+        const [likingData, retweetData] = await Promise.all([
+          twitterClient.getTweetLikingUsers(tweet.tweetId),
+          twitterClient.getTweetRetweetingUsers(tweet.tweetId),
+        ]);
 
-      const newLikedIds = (likingData.data || []).map(u => u.id);
-      const newRetweetIds = (retweetData.data || []).map(u => u.id);
+        const newLikedIds = (likingData?.data || []).map(u => u.id);
+        const newRetweetIds = (retweetData?.data || []).map(u => u.id);
 
-      // Reward them
-      const totalNewRewards = await rewardTweetInteractions(tweet, newLikedIds, newRetweetIds);
+        // Reward them
+        const totalNewRewards = await rewardTweetInteractions(tweet, newLikedIds, newRetweetIds);
 
-      // Save tweet
-      tweet.markModified('likedUserIds');
-      tweet.markModified('retweetedUserIds');
-      await tweet.save();
+        // Save tweet
+        tweet.markModified('likedUserIds');
+        tweet.markModified('retweetedUserIds');
+        await tweet.save();
 
-      return interaction.editReply(
-        `Checked interactions on tweet ID: ${tweetId}. New rewards: **${totalNewRewards}**`
-      );
+        return interaction.editReply(
+          `Checked interactions on tweet ID: ${tweetId}. New rewards: **${totalNewRewards}**`
+        );
+      } catch (error) {
+        // Handle rate limit errors specifically
+        if (error.message && error.message.includes('Rate limit exceeded')) {
+          const endpoint = error.message.split('Rate limit exceeded for ')[1]?.split('.')[0] || 'Twitter API';
+          return interaction.editReply(
+            `Twitter API rate limit reached for ${endpoint}. Please try again later.`
+          );
+        }
+        
+        throw error; // Re-throw for general error handling
+      }
     } catch (err) {
       logger.error('Error checking x-interaction:', err);
       return interaction.editReply('Error occurred checking interactions.');

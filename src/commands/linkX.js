@@ -1,6 +1,6 @@
 // src/commands/linkX.js
-const axios = require('axios');
 const User = require('../models/User');
+const twitterClient = require('../utils/twitterClient');
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -77,28 +77,31 @@ module.exports = {
       // Acknowledge "Yes" click
       await buttonInteraction.update({ components: [] });
 
-      if (!process.env.TWITTER_BEARER_TOKEN) {
-        throw new Error('Missing TWITTER_BEARER_TOKEN in environment variables');
-      }
-
-      // Twitter API call for user data
-      const url = `https://api.twitter.com/2/users/by/username/${username}`;
-      const response = await axios.get(url, {
-        headers: {
-          Authorization: `Bearer ${process.env.TWITTER_BEARER_TOKEN}`
+      try {
+        // Twitter API call using rate-limited client
+        const response = await twitterClient.getUserByUsername(username);
+        
+        const twitterUser = response.data;
+        if (!twitterUser) {
+          return interaction.followUp({ content: `Could not find Twitter user @${username}.`, ephemeral: true });
         }
-      });
 
-      const twitterUser = response.data.data;
-      if (!twitterUser) {
-        return interaction.followUp({ content: `Could not find Twitter user @${username}.`, ephemeral: true });
+        userDoc.twitterId = twitterUser.id;
+        userDoc.twitterUsername = username;
+        await userDoc.save();
+
+        return interaction.followUp({ content: `Successfully linked your account to @${username}.`, ephemeral: true });
+      } catch (error) {
+        // Handle rate limit errors specifically
+        if (error.message && error.message.includes('Rate limit exceeded')) {
+          return interaction.followUp({ 
+            content: 'Twitter API rate limit reached. Please try again in a few minutes.', 
+            ephemeral: true 
+          });
+        }
+        
+        throw error; // Re-throw for general error handling
       }
-
-      userDoc.twitterId = twitterUser.id;
-      userDoc.twitterUsername = username;
-      await userDoc.save();
-
-      return interaction.followUp({ content: `Successfully linked your account to @${username}.`, ephemeral: true });
     } catch (err) {
       logger.error('Error linking Twitter account:', err);
       return interaction.followUp({ content: 'Error linking your Twitter username.', ephemeral: true });

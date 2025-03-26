@@ -1,8 +1,8 @@
-// src/commands/x-tweet.js
+// src/commands/xTweet.js
 const { PermissionsBitField, ButtonBuilder, ButtonStyle, ActionRowBuilder, EmbedBuilder, AttachmentBuilder } = require('discord.js');
-const axios = require('axios');
 const path = require('path');
 const Tweet = require('../models/Tweet');
+const twitterClient = require('../utils/twitterClient');
 const winston = require('winston');
 
 const logger = winston.createLogger({
@@ -11,65 +11,10 @@ const logger = winston.createLogger({
 });
 
 const TWO_DAYS_MS = 2 * 24 * 60 * 60 * 1000;
-let cachedUsername = null;
-let lastUserFetchTime = 0;
 
 /**
- * Fetch username with 2-day caching to minimize calls
+ * Post tweet content to the Discord channel
  */
-async function fetchTwitterUsername(accountId, bearerToken) {
-  const now = Date.now();
-  if (cachedUsername && now - lastUserFetchTime <= TWO_DAYS_MS) {
-    return cachedUsername;
-  }
-  const userUrl = `https://api.twitter.com/2/users/${accountId}`;
-  try {
-    const userRes = await axios.get(userUrl, {
-      headers: { Authorization: `Bearer ${bearerToken}` },
-      params: { 'user.fields': 'username' },
-    });
-    const twitterUser = userRes?.data?.data;
-    if (!twitterUser?.username) {
-      throw new Error('Could not fetch valid Twitter user data.');
-    }
-    cachedUsername = twitterUser.username;
-    lastUserFetchTime = now;
-    return cachedUsername;
-  } catch (error) {
-    logger.error('Error fetching Twitter username:', error.message);
-    throw new Error('Failed to fetch Twitter username.');
-  }
-}
-
-async function fetchLatestTweet(accountId, bearerToken) {
-  const tweetsUrl = `https://api.twitter.com/2/users/${accountId}/tweets`;
-  try {
-    const tweetsRes = await axios.get(tweetsUrl, {
-      headers: { Authorization: `Bearer ${bearerToken}` },
-      params: {
-        max_results: 5,
-        'tweet.fields': 'created_at,text',
-        expansions: 'attachments.media_keys',
-        'media.fields': 'url,type',
-      },
-    });
-    const tweets = tweetsRes?.data?.data;
-    if (!tweets?.length) return null;
-
-    const tweet = tweets[0];
-    // Check for media
-    let tweetImageUrl = null;
-    if (tweetsRes.data.includes?.media?.length) {
-      tweetImageUrl = tweetsRes.data.includes.media[0].url;
-    }
-    tweet.imageUrl = tweetImageUrl;
-    return tweet;
-  } catch (error) {
-    logger.error('Error fetching tweets:', error.message);
-    throw new Error('Failed to fetch tweets from Twitter.');
-  }
-}
-
 async function postTweetToDiscord(channel, username, latestTweet, tweetPostedAt) {
   const twoDaysLaterUnix = Math.floor((tweetPostedAt.getTime() + TWO_DAYS_MS) / 1000);
   const discordTimestamp = `<t:${twoDaysLaterUnix}:R>`; // e.g. "in 2 days"
@@ -122,18 +67,45 @@ module.exports = {
 
     await interaction.deferReply({ ephemeral: true });
 
-    const { TWITTER_ACCOUNT_ID, TWITTER_BEARER_TOKEN, TWITTER_POST_CHANNEL_ID } = process.env;
+    const { TWITTER_ACCOUNT_ID, TWITTER_POST_CHANNEL_ID } = process.env;
+    
     try {
-      const username = await fetchTwitterUsername(TWITTER_ACCOUNT_ID, TWITTER_BEARER_TOKEN);
-      const latestTweet = await fetchLatestTweet(TWITTER_ACCOUNT_ID, TWITTER_BEARER_TOKEN);
-      if (!latestTweet?.id) {
+      // Get user info using rate-limited client
+      const userResponse = await twitterClient.getUserByUsername(TWITTER_ACCOUNT_ID);
+      if (!userResponse.data) {
+        return interaction.editReply('Could not fetch Twitter account information.');
+      }
+      
+      const username = userResponse.data.username;
+      
+      // Get latest tweets using rate-limited client
+      const tweetsResponse = await twitterClient.getUserTweets(TWITTER_ACCOUNT_ID);
+      if (!tweetsResponse.data || tweetsResponse.data.length === 0) {
         return interaction.editReply('No recent Tweets found.');
       }
+      
+      // Process the response
+      const latestTweet = tweetsResponse.data[0];
+      
+      // Check for media
+      let tweetImageUrl = null;
+      if (tweetsResponse.includes?.media?.length) {
+        const media = tweetsResponse.includes.media.find(m => m.type === 'photo');
+        if (media) {
+          tweetImageUrl = media.url;
+        }
+      }
+      
+      // Add image URL to tweet data
+      latestTweet.imageUrl = tweetImageUrl;
+      
+      // Check if we've already posted this tweet
       const existingTweet = await Tweet.findOne({ tweetId: latestTweet.id });
       if (existingTweet) {
         return interaction.editReply('No new Tweet to post.');
       }
 
+      // Get the Discord channel
       const channel = await interaction.client.channels.fetch(TWITTER_POST_CHANNEL_ID);
       if (!channel?.isTextBased()) {
         return interaction.editReply('Invalid channel for posting Tweets.');
@@ -154,6 +126,14 @@ module.exports = {
 
       return interaction.editReply('Latest Tweet posted!');
     } catch (error) {
+      // Handle rate limit errors specifically
+      if (error.message && error.message.includes('Rate limit exceeded')) {
+        const endpoint = error.message.split('Rate limit exceeded for ')[1]?.split('.')[0] || 'Twitter API';
+        return interaction.editReply(
+          `Twitter API rate limit reached for ${endpoint}. Please try again later.`
+        );
+      }
+      
       logger.error('Error in x-tweet command:', error);
       return interaction.editReply('Error fetching or posting Tweet.');
     }

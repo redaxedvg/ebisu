@@ -1,107 +1,120 @@
 // src/events/interactionCreate.js
 const { Events } = require('discord.js');
-const gmCommand = require('../commands/gm');
-const xTweetCommand = require('../commands/xTweet');
-const xInteractionCommand = require('../commands/xInteraction');
-const linkXCommand = require('../commands/linkX');
-const leaderboardCommand = require('../commands/leaderboard');
-const statsCommand = require('../commands/stats');
-const marketplaceMain = require('../commands/marketplace');
-const { giveCoins, takeCoins } = require('../commands/adminGiveTake');
-const { resetLeaderboard, resetStats } = require('../commands/adminReset');
-const winston = require('winston');
-const MarketplaceItem = require('../models/MarketplaceItem');
-const User = require('../models/User');
+const logger = require('../utils/logger');
+const commandRegistry = require('../utils/commandRegistry');
+const { captureException } = require('../utils/errorMonitoring');
+const marketplaceCommands = require('../commands/marketplace');
 
-const logger = winston.createLogger({
-  level: 'info',
-  transports: [new winston.transports.Console({ format: winston.format.simple() })],
-});
-
+/**
+ * Interaction event handler to process all Discord interactions
+ */
 module.exports = {
   name: Events.InteractionCreate,
+  
+  /**
+   * Execute interaction handler
+   * @param {Object} interaction - Discord interaction
+   */
   async execute(interaction) {
+    const contextLog = logger.withContext({
+      module: 'InteractionHandler',
+      userId: interaction.user.id,
+      guildId: interaction.guild?.id
+    });
+    
     try {
+      // Handle command interactions (slash commands)
       if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
-
-        // Commands
-        if (commandName === 'gm') return gmCommand.execute(interaction);
-        if (commandName === 'x-tweet') return xTweetCommand.execute(interaction);
-        if (commandName === 'x-interaction') return xInteractionCommand.execute(interaction);
-        if (commandName === 'link-x') return linkXCommand.execute(interaction);
-        if (commandName === 'leaderboard') return leaderboardCommand.execute(interaction);
-        if (commandName === 'stats') return statsCommand.execute(interaction);
-
-        if (commandName === 'marketplace') return marketplaceMain.execute(interaction);
-        if (commandName === 'add-marketplace') return marketplaceMain.addMarketplace(interaction);
-        if (commandName === 'remove-marketplace') return marketplaceMain.removeMarketplace(interaction);
-        if (commandName === 'edit-marketplace') return marketplaceMain.editMarketplace(interaction);
-
-        if (commandName === 'give-coins') return giveCoins(interaction);
-        if (commandName === 'take-coins') return takeCoins(interaction);
-        if (commandName === 'reset-leaderboard') return resetLeaderboard(interaction);
-        if (commandName === 'reset-stats') return resetStats(interaction);
-
-      } else if (interaction.isButton()) {
-        // Marketplace purchase
-        if (interaction.customId.startsWith('purchase_')) {
-          await interaction.deferReply({ ephemeral: true });
-          try {
-            const itemId = interaction.customId.split('_')[1];
-            const item = await MarketplaceItem.findById(itemId);
-            if (!item) {
-              return interaction.editReply('This item no longer exists.');
-            }
-
-            let userDoc = await User.findOneAndUpdate(
-              { discordId: interaction.user.id },
-              { $setOnInsert: { username: interaction.user.username } },
-              { new: true, upsert: true }
-            );
-
-            if (userDoc.coins < item.price) {
-              const diff = item.price - userDoc.coins;
-              return interaction.editReply(`You need **${diff}** more coins to buy **${item.name}**.`);
-            }
-
-            userDoc.coins -= item.price;
-            await userDoc.save();
-
-            const role = interaction.guild.roles.cache.get(item.roleId);
-            if (!role) {
-              return interaction.editReply(`The role for **${item.name}** no longer exists.`);
-            }
-
-            const member = await interaction.guild.members.fetch(interaction.user.id);
-            await member.roles.add(role);
-
-            await interaction.editReply(`You purchased **${item.name}** and received **${role.name}**!`);
-
-            // Announce if desired
-            const announceChannelId = process.env.MARKETPLACE_ANNOUNCE_CHANNEL;
-            if (announceChannelId) {
-              try {
-                const announceChannel = await interaction.client.channels.fetch(announceChannelId);
-                if (announceChannel?.isTextBased()) {
-                  await announceChannel.send(`Congratulations, **<@${interaction.user.id}>** became ${role}`);
-                }
-              } catch (e) {
-                logger.error('Failed to send marketplace announcement:', e);
-              }
-            }
-          } catch (err) {
-            logger.error('Error processing marketplace purchase button:', err);
-            interaction.editReply('An error occurred while processing your purchase.');
-          }
+        
+        contextLog.debug(`Processing command: ${commandName}`);
+        
+        // Use the command registry to execute commands dynamically
+        const executed = await commandRegistry.execute(commandName, interaction);
+        
+        if (!executed) {
+          contextLog.warn(`Command not found in registry: ${commandName}`);
+          await interaction.reply({ 
+            content: 'That command is not currently available.',
+            ephemeral: true
+          });
         }
+        
+        return;
+      } 
+      // Handle button interactions
+      else if (interaction.isButton()) {
+        const { customId } = interaction;
+        contextLog.debug(`Processing button interaction: ${customId}`);
+        
+        // Handle marketplace purchases
+        if (customId.startsWith('purchase_')) {
+          const itemId = customId.split('_')[1];
+          return marketplaceCommands.processPurchase(interaction, itemId);
+        }
+        
+        // Add handling for other button types as needed
+        contextLog.warn(`Unhandled button interaction: ${customId}`);
+      }
+      // Handle select menu interactions
+      else if (interaction.isStringSelectMenu()) {
+        const { customId } = interaction;
+        contextLog.debug(`Processing select menu: ${customId}`);
+        
+        // Add handling for select menus as needed
+      }
+      // Handle modal submissions
+      else if (interaction.isModalSubmit()) {
+        const { customId } = interaction;
+        contextLog.debug(`Processing modal submission: ${customId}`);
+        
+        // Add handling for modals as needed
+      }
+      // Handle context menu interactions
+      else if (interaction.isContextMenuCommand()) {
+        const { commandName } = interaction;
+        contextLog.debug(`Processing context menu command: ${commandName}`);
+        
+        // Add handling for context menu commands as needed
+      }
+      // Handle autocomplete interactions
+      else if (interaction.isAutocomplete()) {
+        const { commandName } = interaction;
+        contextLog.debug(`Processing autocomplete for: ${commandName}`);
+        
+        // Add handling for autocomplete as needed
       }
     } catch (error) {
-      logger.error('Error in interactionCreate event:', error);
-      if (interaction.replied || interaction.deferred) {
-        await interaction.editReply('An error occurred while processing this interaction.');
-      } else {
-        await interaction.reply({ content: 'An error occurred while processing this interaction.', ephemeral: true });
+      captureException(error, {
+        area: 'interaction-handler',
+        interaction: {
+          type: interaction.type,
+          commandName: interaction.commandName,
+          customId: interaction.customId,
+        }
+      });
+      
+      contextLog.error('Unhandled error in interaction handler', {
+        error: error.message,
+        stack: error.stack
+      });
+      
+      // Attempt to respond to the user
+      try {
+        const reply = { 
+          content: 'An error occurred while processing this interaction.',
+          ephemeral: true
+        };
+        
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply(reply);
+        } else {
+          await interaction.reply(reply);
+        }
+      } catch (replyError) {
+        contextLog.error('Failed to reply after interaction error', {
+          error: replyError.message
+        });
       }
     }
   },
